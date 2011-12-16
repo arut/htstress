@@ -1,0 +1,88 @@
+*************************************************
+* htstress
+*************************************************
+Fast HTTP Benchmarking Tool
+
+
+About
+*************************************************
+htstress is used for benchmarking HTTP services
+on Linux. It's similar to Apache Benchmark (ab) 
+but provides multithreading support which is 
+essential in bechmarking highload services (>5K rps).
+
+Build
+*************************************************
+htstress does not require any libs. Just run 
+./build.sh
+
+Usage
+*************************************************
+Arguments are similar to ab's:
+
+-n total number of requests to make [OPTIONAL]
+-c concurrency
+-t threads number
+
+If -n is missing, endless benchmark is started.
+Use Ctrl-C to abort and see the result.
+
+Set threads number equal to the number of
+cores in your CPU for best results.
+
+Comparison
+*************************************************
+Here's the result of running htstress on 8-core 
+machine benchmarking dummy NGINX page:
+
+./htstress -n 10000 -c 100 -t 8 localhost:8087
+
+0 requests
+1000 requests
+2000 requests
+3000 requests
+4000 requests
+5000 requests
+6000 requests
+7000 requests
+8000 requests
+9000 requests
+
+requests:      10000          <-- total #requests
+good requests: 10000 [100%]   <-- #requests ended with 1xx, 2xx, 3xx codes
+bad requests:  0 [0%]         <-- #requests ended with 4xx or 5xx code
+seconds:       0.742
+requests/sec:  13469.301      <-- rps - major benchmark result
+
+
+
+Let's take a look what we have in single-threaded case.
+Try ab first:
+
+ab -n 10000 -c 100 http://localhost:8087/
+This is ApacheBench, Version 1.3d <$Revision: 1.1.1.13 $> apache-1.3
+Copyright (c) 1996 Adam Twiss, Zeus Technology Ltd, http://www.zeustech.net/
+Copyright (c) 2006 The Apache Software Foundation, http://www.apache.org/
+...
+Requests per second:    8554.32 [#/sec] (mean) <-- not much
+...
+
+Try htstress in single-threaded mode:
+
+./htstress -n 10000 -c 100 -t 1 localhost:8087
+...
+requests/sec:  8679.237 <-- similar rps in single-threaded case
+
+
+We have 8.5K rps in singlethreaded case 
+vs 13K rps in multithreaded.
+
+It's obvious single-threaded HTTP benchmarking is
+not enough to test high-load event-based services. 
+The benchmark tool itself eats 100% of a
+single CPU core and cannot give a true result.
+
+*************************************************
+
+(c) 2011 Roman Arutyunyan (arut@qip.ru)
+
