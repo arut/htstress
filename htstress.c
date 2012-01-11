@@ -171,7 +171,7 @@ static void* worker(void* arg)
 
 	for(;;) {
 
-		nevts = epoll_wait(efd, evts, sizeof(evts) / sizeof(evts[0]), 0);
+		nevts = epoll_wait(efd, evts, sizeof(evts) / sizeof(evts[0]), -1);
 
 		if (nevts == -1) {
 			perror("epoll_wait");
@@ -227,14 +227,17 @@ static void* worker(void* arg)
 
 			} else if (evts[n].events & EPOLLIN) {
 
-				ret = recv(ec->fd, inbuf, sizeof(inbuf), 0);
+				for(;;) {
 
-				if (ret == -1 && errno != EAGAIN) {
-					perror("recv");
-					exit(1);
-				}
+					ret = recv(ec->fd, inbuf, sizeof(inbuf), 0);
 
-				if (ret > 0) {
+					if (ret == -1 && errno != EAGAIN) {
+						perror("recv");
+						exit(1);
+					}
+
+					if (ret <= 0)
+						break;
 
 					if (ec->offs <= 9 && ec->offs + ret > 10) {
 
@@ -248,6 +251,7 @@ static void* worker(void* arg)
 						write(2, inbuf, ret);
 
 					ec->offs += ret;
+
 				}
 
 				if (!ret) {
