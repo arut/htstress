@@ -41,7 +41,13 @@ OF SUCH DAMAGE.
 #include <stdlib.h>
 #include <fcntl.h>
 #include <sys/time.h>
-#include <malloc.h>
+#ifdef __APPLE__ /* Darwin OS X */
+#	include <malloc/malloc.h>
+#elif defined(BSD) /* FreeBSD, NetBSD, OpenBSD */
+#	include <malloc.h>
+#else /* Linux */
+#	include <malloc.h>
+#endif
 #include <getopt.h>
 #include <signal.h>
 #include <sys/epoll.h>
