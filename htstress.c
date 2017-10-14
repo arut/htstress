@@ -48,6 +48,8 @@ OF SUCH DAMAGE.
 #include <signal.h>
 #include <sys/epoll.h>
 #include <inttypes.h>
+#include <signal.h>
+typedef void (*sighandler_t)(int);
 
 #define HTTP_REQUEST_PREFIX "http://"
 
@@ -89,6 +91,7 @@ volatile uint64_t out_bytes = 0;
 uint64_t ticks;
 
 int debug = 0;
+int exit_i = 0;
 
 struct timeval tv, tve;
 
@@ -179,7 +182,13 @@ static void* worker(void* arg)
 
 	for(;;) {
 
-		nevts = epoll_wait(efd, evts, sizeof(evts) / sizeof(evts[0]), -1);
+		do {
+			nevts = epoll_wait(efd, evts, sizeof(evts) / sizeof(evts[0]), -1);
+		} while (!exit_i && nevts < 0 && errno == EINTR);
+
+		if (exit_i != 0) {
+			exit(0);
+		}
 
 		if (nevts == -1) {
 			perror("epoll_wait");
@@ -302,6 +311,10 @@ static void* worker(void* arg)
 	}
 }
 
+void signal_exit(int signal) {
+	exit_i++;
+}
+
 static void print_usage() 
 {
 	printf("Usage: htstress [options] [http://]hostname[:port]/path\n"
@@ -334,6 +347,21 @@ int main(int argc, char* argv[])
 	struct addrinfo *result, *rp;
 	struct addrinfo hints;
 	int j, testfd;
+
+	sighandler_t ret;
+	ret = signal(SIGINT, signal_exit);
+
+	if (ret == SIG_ERR) {
+		perror("signal(SIGINT, handler)");
+		exit(0);
+	}
+
+	ret = signal(SIGTERM, signal_exit);
+
+	if (ret == SIG_ERR) {
+		perror("signal(SIGTERM, handler)");
+		exit(0);
+	}
 
 	memset(&hints, 0, sizeof(struct addrinfo));
 	hints.ai_family = AF_UNSPEC;
