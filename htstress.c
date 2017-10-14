@@ -33,12 +33,14 @@ OF SUCH DAMAGE.
 #include <stdio.h>
 #include <pthread.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <netinet/ip.h>
 #include <errno.h>
 #include <malloc.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <fcntl.h>
 #include <sys/time.h>
 #include <malloc.h>
@@ -46,6 +48,8 @@ OF SUCH DAMAGE.
 #include <signal.h>
 #include <sys/epoll.h>
 #include <inttypes.h>
+#include <signal.h>
+typedef void (*sighandler_t)(int);
 
 #define HTTP_REQUEST_PREFIX "http://"
 
@@ -69,10 +73,13 @@ struct econn {
 char *outbuf;
 size_t outbufsize;
 
-struct sockaddr_in ssin;
+struct sockaddr_storage sss;
+socklen_t sssln = 0;
 
 int concurrency = 1;
 int num_threads = 1;
+
+char *udaddr = "";
 
 volatile uint64_t num_requests = 0;
 volatile uint64_t max_requests = 0;
@@ -84,15 +91,18 @@ volatile uint64_t out_bytes = 0;
 uint64_t ticks;
 
 int debug = 0;
+int exit_i = 0;
 
 struct timeval tv, tve;
 
-static const char short_options[] = "n:c:t:d";
+static const char short_options[] = "n:c:t:u:h:d46";
 
 static const struct option long_options[] = {
 	{ "number",       1, NULL, 'n' },
 	{ "concurrency",  1, NULL, 'c' },
 	{ "threads",      0, NULL, 't' },
+	{ "udaddr",       1, NULL, 'u' },
+	{ "host",         1, NULL, 'h' },
 	{ "debug",        0, NULL, 'd' },
 	{ "help",         0, NULL, '%' },
 	{ NULL, 0, NULL, 0 }
@@ -124,7 +134,7 @@ static void init_conn(int efd, struct econn* ec) {
 	struct epoll_event evt;
 	int ret;
 
-	ec->fd = socket(AF_INET, SOCK_STREAM, 0);
+	ec->fd = socket(sss.ss_family, SOCK_STREAM, 0);
 	ec->offs = 0;
 	ec->flags = 0;
 
@@ -135,7 +145,9 @@ static void init_conn(int efd, struct econn* ec) {
 
 	fcntl(ec->fd, F_SETFL, O_NONBLOCK);
 
-	ret = connect(ec->fd, (struct sockaddr*)&ssin, sizeof(ssin));
+	do {
+		ret = connect(ec->fd, (struct sockaddr*)&sss, sssln);
+	} while (ret && errno == EAGAIN);
 
 	if (ret && errno != EINPROGRESS) {
 		perror("connect() failed");
@@ -170,7 +182,13 @@ static void* worker(void* arg)
 
 	for(;;) {
 
-		nevts = epoll_wait(efd, evts, sizeof(evts) / sizeof(evts[0]), -1);
+		do {
+			nevts = epoll_wait(efd, evts, sizeof(evts) / sizeof(evts[0]), -1);
+		} while (!exit_i && nevts < 0 && errno == EINTR);
+
+		if (exit_i != 0) {
+			exit(0);
+		}
 
 		if (nevts == -1) {
 			perror("epoll_wait");
@@ -186,9 +204,19 @@ static void* worker(void* arg)
 				exit(1);
 			}
 
-			if (evts[n].events & (EPOLLHUP | EPOLLERR)) {
+			if (evts[n].events & EPOLLERR) {
 				/* normally this should not happen */
-				fprintf(stderr, "broken connection");
+				int       error = 0;
+				socklen_t errlen = sizeof(error);
+				if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (void *)&error, &errlen) == 0) {
+					fprintf(stderr, "error = %s\n", strerror(error));
+				}
+				exit(1);
+			}
+
+			if (evts[n].events & EPOLLHUP) {
+				/* This can happen for HTTP/1.0 */
+				fprintf(stderr, "EPOLLHUP\n");
 				exit(1);
 			}
 
@@ -283,6 +311,10 @@ static void* worker(void* arg)
 	}
 }
 
+void signal_exit(int signal) {
+	exit_i++;
+}
+
 static void print_usage() 
 {
 	printf("Usage: htstress [options] [http://]hostname[:port]/path\n"
@@ -290,6 +322,8 @@ static void print_usage()
 			"   -n, --number       total number of requests (0 for inifinite, Ctrl-C to abort)\n"
 			"   -c, --concurrency  number of concurrent connections\n"
 			"   -t, --threads      number of threads (set this to the number of CPU cores)\n"
+			"   -u, --udaddr       path to unix domain socket\n"
+			"   -h, --host         host to use for http request\n"
 			"   -d, --debug        debug HTTP response\n"
 			"   --help             display this message\n"
 		  );
@@ -303,9 +337,38 @@ int main(int argc, char* argv[])
 	int next_option;
 	int n;
 	pthread_t useless_thread;
-	int port = 80;
 	char *host = NULL;
+	char *node = NULL;
+	char *port = "http";
 	struct hostent *h;
+	struct sockaddr_in *ssin = (struct sockaddr_in *)&sss;
+	struct sockaddr_in6 *ssin6 = (struct sockaddr_in6 *)&sss;
+	struct sockaddr_un *ssun = (struct sockaddr_un *)&sss;
+	struct addrinfo *result, *rp;
+	struct addrinfo hints;
+	int j, testfd;
+
+	sighandler_t ret;
+	ret = signal(SIGINT, signal_exit);
+
+	if (ret == SIG_ERR) {
+		perror("signal(SIGINT, handler)");
+		exit(0);
+	}
+
+	ret = signal(SIGTERM, signal_exit);
+
+	if (ret == SIG_ERR) {
+		perror("signal(SIGTERM, handler)");
+		exit(0);
+	}
+
+	memset(&hints, 0, sizeof(struct addrinfo));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	hints.ai_flags = AI_V4MAPPED | AI_ADDRCONFIG;
+
+	memset(&sss, 0, sizeof(struct sockaddr_storage));
 
 	if (argc == 1)
 		print_usage();
@@ -327,8 +390,24 @@ int main(int argc, char* argv[])
 				num_threads = atoi(optarg);
 				break;
 
+			case 'u':
+				udaddr = optarg;
+				break;
+
 			case 'd':
 				debug = 0x03;
+				break;
+
+			case 'h':
+				host = optarg;
+				break;
+
+			case '4':
+				hints.ai_family = PF_INET;
+				break;
+
+			case '6':
+				hints.ai_family = PF_INET6;
 				break;
 
 			case '%':
@@ -354,7 +433,7 @@ int main(int argc, char* argv[])
 	if (!strncmp(s, HTTP_REQUEST_PREFIX, sizeof(HTTP_REQUEST_PREFIX) - 1))
 		s += (sizeof(HTTP_REQUEST_PREFIX) - 1);
 
-	host = s;
+	node = s;
 
 	rq = strpbrk(s, ":/");
 
@@ -362,28 +441,72 @@ int main(int argc, char* argv[])
 		rq = "/";
 
 	else if (*rq == '/') {
-		host = malloc(rq - s);
-		memcpy(host, rq, rq - s);
-
+		node = strndup(s, rq - s);
+		if(node == NULL) {
+		    perror("node = strndup(s, rq - s)");
+		    exit(EXIT_FAILURE);
+		}
 	} else if (*rq == ':') {
 		*rq++ = 0;
-		port = atoi(rq);
+		port = rq;
 		rq = strchr(rq, '/');
-		if (rq == NULL)
+		if (*rq == '/') {
+			port = strndup(port, rq - port);
+			if(port == NULL) {
+				perror("port = strndup(rq, rq - port)");
+				exit(EXIT_FAILURE);
+			}
+		}
+		else
 			rq = "/";
 	}
 
-	h = gethostbyname(host);
-	if (!h || !h->h_length) {
-		printf("gethostbyname failed\n");
-		return 1;
+	if(strnlen(udaddr, sizeof(ssun->sun_path)-1) == 0) {
+		j = getaddrinfo(node, port, &hints, &result);
+		if (j != 0) {
+			fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(j));
+			exit(EXIT_FAILURE);
+		}
+
+		for (rp = result; rp != NULL; rp = rp->ai_next) {
+			testfd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+			if (testfd == -1)
+				continue;
+
+			if (connect(testfd, rp->ai_addr, rp->ai_addrlen) == 0) {
+				close(testfd);
+				break;
+			}
+
+			close(testfd);
+		}
+
+		if (rp == NULL) { /* No address succeeded */
+			fprintf(stderr, "getaddrinfo failed\n");
+			exit(EXIT_FAILURE);
+		}
+
+		if(rp->ai_addr->sa_family == PF_INET) {
+			*ssin = *(struct sockaddr_in*)rp->ai_addr;
+		} else if(rp->ai_addr->sa_family == PF_INET6) {
+			*ssin6 = *(struct sockaddr_in6*)rp->ai_addr;
+		} else {
+			fprintf(stderr, "invalid family %d from getaddrinfo\n", rp->ai_addr->sa_family);
+			exit(EXIT_FAILURE);
+		}
+		sssln = rp->ai_addrlen;
+
+		freeaddrinfo(result);
+	} else {
+		ssun->sun_family = PF_UNIX;
+		ssun->sun_path;
+		strncpy(ssun->sun_path, udaddr, sizeof(ssun->sun_path)-1);
+		sssln = sizeof(struct sockaddr_un);
 	}
 
-	ssin.sin_addr.s_addr = *(u_int32_t*)h->h_addr;
-	ssin.sin_family = PF_INET;
-	ssin.sin_port = htons(port);
-
 	/* prepare request buffer */
+	if(host == NULL)
+		host = node;
 	outbuf = malloc(strlen(rq) + sizeof(HTTP_REQUEST_FMT) + strlen(host));
 	outbufsize = sprintf(outbuf, HTTP_REQUEST_FMT, rq, host);
 
